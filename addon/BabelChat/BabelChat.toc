@@ -1,0 +1,41 @@
+## Interface: 30300
+## Title: |cffd597ffBabelChat|r
+## Notes: |cFF33CCFFReal-time chat translation — built-in dictionary + companion app overlay.|r
+## Author: Andrey Yumashev, Pirson
+## Version: 3.3.5a
+## X-License: MIT
+## X-Website: https://github.com/Yumash/BabelChat
+
+## SavedVariables: BabelChatDB
+
+# Timers first: everything below may schedule one.
+Timer.lua
+
+# Localization
+Locales.lua
+
+# Dictionary data, one file per category
+Data\Social.lua
+Data\Combate.lua
+Data\Clases.lua
+Data\Roles.lua
+Data\Grupos.lua
+Data\Hermandad.lua
+Data\Profesiones.lua
+Data\Comercio.lua
+Data\Estadisticas.lua
+Data\Estado.lua
+Data\Mazz_Raid.lua
+Data\Slang.lua
+Data\Endgame.lua
+
+# Engine
+DictEngine.lua
+CompanionBuffer.lua
+Config.lua
+MinimapButton.lua
+Haikus.lua
+KosziButton.lua
+Outbox.lua
+Core.lua
+Commands.lua

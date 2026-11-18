@@ -1,0 +1,30 @@
+[project]
+name = "babelchat"
+version = "3.3.5a"
+description = "Real-time WoW chat translator with smart overlay"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-v --tb=short"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"app/glossary_data.py" = ["E501"]
+# Chat lines and their reference translations, one pair per line.
+"tools/translator_corpus.py" = ["E501"]
+# Translated sentences, one per line. Wrapping them across implicit
+# concatenations to satisfy a line length makes them harder to edit for the one
+# person who should be editing them, and the line is data, not code.
+"app/locales/*.py" = ["E501"]
+"app/overlay_gtk.py" = ["E402"]
+"app/settings_gtk.py" = ["E402"]
+"app/setup_wizard_gtk.py" = ["E402"]
+"app/main_gtk.py" = ["E402"]

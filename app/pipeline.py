@@ -1,0 +1,402 @@
+"""Translation pipeline: watcher -> parser -> detector -> cache -> translator -> output."""
+
+from __future__ import annotations
+
+import itertools
+import logging
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from app.cache import DEFAULT_DB_PATH, TranslationCache
+from app.dedup import DeduplicationBuffer
+from app.detector import ChatLanguageDetector, Language
+from app.glossary import expand_wow_terms
+from app.parser import Channel, ChatMessage, parse_line
+from app.phrasebook import lookup as phrasebook_lookup
+from app.phrasebook import lookup_abbreviation as phrasebook_abbrev
+from app.slang import expand_slang
+from app.text_utils import (
+    clean_message_text,
+    restore_tokens,
+    strip_for_translation,
+)
+from app.translator import TranslationResult, TranslatorService
+from app.watcher import ChatLogWatcher
+
+# Memory reader is optional — requires pymem and admin privileges
+try:
+    from app.memory_reader import MemoryChatWatcher
+    HAS_MEMORY_READER = True
+except ImportError:
+    HAS_MEMORY_READER = False
+
+logger = logging.getLogger(__name__)
+
+# Max characters to show in log preview messages
+_LOG_PREVIEW = 60
+
+#: Detected language -> the provider's language code. Only the two languages
+#: the app translates between.
+_LANGUAGE_TO_CODE: dict[Language, str] = {
+    Language.ENGLISH: "EN",
+    Language.HUNGARIAN: "HU",
+}
+
+#: What an undetectable line is assumed to be. On an English-speaking realm a
+#: line the detector cannot place is English chat speak far more often than anything
+#: else, and the translator needs an explicit source language to pick a model.
+_FALLBACK_SOURCE = "EN"
+
+
+def _same_character(author: str, own: str) -> bool:
+    """Whether a chat author is the player, realm suffix or not.
+
+    The addon reports the player as "Name-Realm", while a 3.3.5a client names a
+    same-realm author with the bare name, and the parser keeps the realm apart
+    anyway. So only the name part is compared.
+    """
+    return author.split("-", 1)[0].casefold() == own.split("-", 1)[0].casefold()
+
+
+@dataclass
+class TranslatedMessage:
+    """A chat message with its translation."""
+
+    original: ChatMessage
+    translation: TranslationResult | None
+    source_lang: str = ""
+    msg_id: int = 0       # unique ID for streaming updates
+    is_update: bool = False  # True when this replaces a previous msg_id
+
+
+@dataclass
+class PipelineConfig:
+    """Pipeline configuration."""
+
+    chatlog_path: Path = Path("WoWChatLog.txt")
+    target_lang: str = "HU"
+    own_language: Language = Language.HUNGARIAN
+    own_character: str = ""
+    enabled_channels: set[Channel] = field(default_factory=lambda: {
+        Channel.SAY, Channel.YELL, Channel.PARTY, Channel.PARTY_LEADER,
+        Channel.RAID, Channel.RAID_LEADER, Channel.GUILD,
+        Channel.WHISPER_FROM, Channel.WHISPER_TO,
+        Channel.INSTANCE, Channel.INSTANCE_LEADER,
+    })
+    skip_own_messages: bool = True
+    translation_enabled: bool = True
+    db_path: str = field(default_factory=lambda: DEFAULT_DB_PATH)
+    use_memory_reader: bool = True  # Reads addon buffer from WoW process memory
+
+
+class TranslationPipeline:
+    """Orchestrates the full translation pipeline.
+
+    Flow: file watcher -> line parser -> language detector -> cache lookup
+    -> API translation -> output callback.
+    """
+
+    def __init__(
+        self,
+        config: PipelineConfig,
+        on_message: Callable[[TranslatedMessage], None],
+    ) -> None:
+        self._config = config
+        self._on_message = on_message
+
+        self._cache = TranslationCache(db_path=config.db_path)
+        self._cache.cleanup()  # remove expired entries on startup
+        self._detector = ChatLanguageDetector(own_language=config.own_language)
+        self._translator = TranslatorService()
+        self._watcher = ChatLogWatcher(config.chatlog_path, self._on_new_line)
+
+        # Deduplication: track recent (author, text) to avoid double-delivery
+        # when both memory reader and file watcher deliver the same message
+        self._dedup = DeduplicationBuffer()
+
+        # Streaming: monotonic message ID for progressive rendering
+        # itertools.count is thread-safe in CPython (atomic C-level next())
+        self._msg_id_counter = itertools.count(1)
+
+        # Memory reader (optional, real-time delivery)
+        #: Channels already named as switched off, so the notice appears once
+        #: rather than on every message.
+        self._reported_off_channels: set = set()
+        self._memory_watcher = None
+        if config.use_memory_reader and HAS_MEMORY_READER:
+            self._memory_watcher = MemoryChatWatcher(self._on_new_line)
+            logger.info("Memory reader available, will try real-time mode")
+
+    @property
+    def translation_enabled(self) -> bool:
+        return self._config.translation_enabled
+
+    @translation_enabled.setter
+    def translation_enabled(self, value: bool) -> None:
+        self._config.translation_enabled = value
+        logger.info("Translation %s", "enabled" if value else "disabled")
+
+    def update_config(self, config: PipelineConfig) -> None:
+        """Hot-update pipeline settings without restart.
+
+        Updates detector language, target language, enabled channels, etc.
+        Called from the main thread when user saves settings.
+        """
+        old_own = self._config.own_language
+        old_target = self._config.target_lang
+        # Preserve the RUNTIME translation on/off state: the incoming config
+        # carries translation_enabled_default, which would silently override a
+        # user's live TL toggle (and desync the toggle button) on settings save.
+        config.translation_enabled = self._config.translation_enabled
+        self._config = config
+        self._detector.own_language = config.own_language
+        if old_own != config.own_language:
+            logger.info("Own language changed: %s -> %s", old_own, config.own_language)
+        if old_target != config.target_lang:
+            logger.info("Target language changed: %s -> %s", old_target, config.target_lang)
+
+    def load_history(self, max_lines: int = 50) -> list[TranslatedMessage]:
+        """Read last N lines from the log and parse them (no translation)."""
+        lines = self._watcher.read_tail(max_lines)
+        messages = []
+        for line in lines:
+            msg = parse_line(line)
+            if msg is None:
+                continue
+            if msg.channel not in self._config.enabled_channels:
+                continue
+            messages.append(TranslatedMessage(original=msg, translation=None))
+        return messages
+
+    def start(self) -> None:
+        """Start watching the chat log and translating.
+
+        Tries memory reader first for real-time delivery.
+        File watcher only starts as fallback when memory reader is unavailable.
+        Running both causes duplicate messages (WoW buffers chatlog writes
+        for minutes, then flushes a huge batch that bypasses dedup TTL).
+        """
+        # Try memory reader first (real-time, preferred)
+        if self._memory_watcher:
+            try:
+                self._memory_watcher.start()
+                logger.info("Pipeline started (memory reader only)")
+                return
+            except (RuntimeError, OSError) as e:
+                logger.warning("Memory reader failed to start: %s", e)
+
+        # Fallback: file watcher only
+        self._watcher.start()
+        logger.info("Pipeline started (file watcher only)")
+
+    def clear_cache(self) -> int:
+        """Forget every cached translation, in SQLite and in memory.
+
+        Exposed here because the pipeline owns the live cache. A caller that
+        opens its own TranslationCache clears whichever database the DEFAULT
+        path points at — not necessarily this one — and leaves this instance's
+        in-memory LRU serving the very messages the user asked to be forgotten.
+        """
+        return self._cache.clear()
+
+    def stop(self) -> None:
+        """Stop the pipeline."""
+        if self._memory_watcher:
+            self._memory_watcher.stop()
+        self._watcher.stop()  # safe even if not started
+        self._cache.close()
+        logger.info("Pipeline stopped")
+
+    def _on_new_line(
+        self, line: str, *,
+        dict_translated: bool = False,
+        **_kwargs: object,
+    ) -> None:
+        """Process a new line from the chat log or memory reader.
+
+        Args:
+            line: WoW chat log format line.
+            dict_translated: If True, the addon's dictionary already translated
+                this message inline in chat.
+        """
+        # Length, not content: this runs before parsing and therefore before
+        # the channel filter, so quoting the line here would put a whisper in
+        # the log of a user who had unticked Whispers. The opt-in capture
+        # trace is where the full text belongs.
+        logger.debug("New line (%d chars)", len(line))
+        msg = parse_line(line)
+        if msg is None:
+            logger.debug("Parse returned None for: %s", line[:150])
+            return
+
+        # Snapshot config for consistent reads within this method.
+        # Reference assignment is atomic under CPython's GIL, so this is safe
+        # even when update_config() replaces self._config from another thread.
+        cfg = self._config
+
+        # Deduplicate: both memory reader and file watcher may deliver same message
+        if self._dedup.is_duplicate((msg.author, msg.text)):
+            logger.debug("Duplicate message from %s, skipping", msg.author)
+            return
+
+        # Filter by channel
+        if msg.channel not in cfg.enabled_channels:
+            # Once per channel, at a level the user will actually see. A tester
+            # joined a channel, typed in it, and got nothing — the reason was
+            # here, at DEBUG, behind a console that is off by default. The
+            # channel name carries no message text, so this is safe to log.
+            if msg.channel not in self._reported_off_channels:
+                self._reported_off_channels.add(msg.channel)
+                logger.warning(
+                    "Channel %s is switched off in Settings -> Channels, so its messages are not translated",
+                    msg.channel.value,
+                )
+            return
+
+        # Only now, past the channel filter, and at DEBUG. This line carries the
+        # author and the message text, and it used to run BEFORE the filter at
+        # INFO — the default level — so a user who had unticked Whispers still
+        # got other people's whispers written to their log file.
+        logger.debug(
+            "Parsed: [%s] %s: %s (dict=%s)",
+            msg.channel.value, msg.author, msg.text[:_LOG_PREVIEW], dict_translated,
+        )
+
+        # NPC filter: NPC names contain spaces (e.g. "High King Anduin"),
+        # player names never do. Only applies to Say/Yell channels.
+        if msg.channel in (Channel.SAY, Channel.YELL) and " " in msg.author:
+            logger.debug("NPC message filtered: %s", msg.author[:40])
+            return
+
+        # Own messages — show in overlay but skip translation when configured
+        own_char = cfg.own_character
+        if not own_char and self._memory_watcher:
+            own_char = self._memory_watcher.player_name
+        if (
+            cfg.skip_own_messages
+            and own_char
+            and _same_character(msg.author, own_char)
+        ):
+            logger.debug("Skip own message (no translate): %s", msg.text[:_LOG_PREVIEW])
+            self._on_message(TranslatedMessage(original=msg, translation=None))
+            return
+
+        # Translation disabled — still emit message without translation
+        if not cfg.translation_enabled:
+            self._on_message(TranslatedMessage(original=msg, translation=None))
+            return
+
+        # Dictionary-translated by addon — ignore the addon's gloss and do a
+        # full translation instead; the gloss is redundant next to it.
+        if dict_translated:
+            logger.debug("Dict message ignored, translating instead: %s", msg.text[:_LOG_PREVIEW])
+
+        # Clean and validate text
+        cleaned_text = clean_message_text(msg.text)
+        if not cleaned_text.strip():
+            return
+
+        target_lang = cfg.target_lang
+
+        # Check abbreviations before language detection (catches short gg/ty/bb
+        # that would fail MIN_TEXT_LENGTH in the detector)
+        abbrev_hit = phrasebook_abbrev(cleaned_text, target_lang)
+        if abbrev_hit is not None:
+            result = TranslationResult(
+                original=cleaned_text, translated=abbrev_hit,
+                source_lang="", target_lang=target_lang,
+                success=True,
+            )
+            self._on_message(TranslatedMessage(
+                original=msg, translation=result,
+            ))
+            return
+
+        # Detect language
+        detected = self._detector.detect(cleaned_text)
+        if detected is None:
+            # Own language or skip-phrase — emit without translation
+            logger.debug("Skip (own lang / skip-phrase): %r", cleaned_text[:_LOG_PREVIEW])
+            self._on_message(TranslatedMessage(original=msg, translation=None))
+            return
+
+        if detected == ChatLanguageDetector.UNKNOWN:
+            source_lang = _FALLBACK_SOURCE
+        else:
+            source_lang = _LANGUAGE_TO_CODE.get(detected, _FALLBACK_SOURCE)
+        logger.debug("Translating %s→%s: %r", source_lang, target_lang, cleaned_text[:_LOG_PREVIEW])
+
+        # Check phrasebook (instant, no API call)
+        phrasebook_hit = phrasebook_lookup(cleaned_text, source_lang, target_lang)
+        if phrasebook_hit is not None:
+            result = TranslationResult(
+                original=cleaned_text, translated=phrasebook_hit,
+                source_lang=source_lang, target_lang=target_lang,
+                success=True,
+            )
+            self._on_message(TranslatedMessage(
+                original=msg, translation=result, source_lang=source_lang,
+            ))
+            return
+
+        # Check cache
+        cached = self._cache.get(cleaned_text, source_lang, target_lang)
+        if cached is not None:
+            result = TranslationResult(
+                original=cleaned_text, translated=cached,
+                source_lang=source_lang, target_lang=target_lang,
+                success=True,
+            )
+            self._on_message(TranslatedMessage(
+                original=msg, translation=result, source_lang=source_lang,
+            ))
+            return
+
+        # Strip URLs, WoW markers before translation
+        text_to_translate, replacements = strip_for_translation(cleaned_text)
+
+        # Expand gaming slang to plain English so the provider can understand it
+        expanded = expand_slang(text_to_translate)
+        if expanded != text_to_translate:
+            logger.debug("Slang expanded: %r → %r", text_to_translate[:_LOG_PREVIEW], expanded[:_LOG_PREVIEW])
+            text_to_translate = expanded
+
+        # Expand WoW-specific terms (context-gated: 2+ gaming terms required)
+        wow_expanded = expand_wow_terms(text_to_translate)
+        if wow_expanded != text_to_translate:
+            logger.debug("WoW terms expanded: %r → %r", text_to_translate[:_LOG_PREVIEW], wow_expanded[:_LOG_PREVIEW])
+            text_to_translate = wow_expanded
+
+        # --- STREAMING: emit original immediately, then update with translation ---
+        msg_id = next(self._msg_id_counter)
+        self._on_message(TranslatedMessage(
+            original=msg, translation=None,
+            source_lang=source_lang, msg_id=msg_id,
+        ))
+
+        # Translate via API (this blocks — called from watchdog thread)
+        result = self._translator.translate(
+            text_to_translate, target_lang=target_lang,
+            source_lang=source_lang,
+        )
+        translated_preview = result.translated[:_LOG_PREVIEW] if result.translated else ""
+        logger.debug("Result from %s: success=%s, translated=%r", result.backend, result.success, translated_preview)
+
+        # Restore preserved tokens in translated text
+        if result.success and replacements:
+            restored = restore_tokens(result.translated, replacements)
+            result = TranslationResult(
+                original=cleaned_text, translated=restored,
+                source_lang=result.source_lang, target_lang=result.target_lang,
+                success=True,
+            )
+
+        if result.success:
+            self._cache.put(cleaned_text, source_lang, target_lang, result.translated)
+
+        # --- STREAMING: emit translation update ---
+        self._on_message(TranslatedMessage(
+            original=msg, translation=result, source_lang=source_lang,
+            msg_id=msg_id, is_update=True,
+        ))

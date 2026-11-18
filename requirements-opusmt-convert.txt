@@ -1,0 +1,8 @@
+# One-time only: converting the official OPUS-MT models to CTranslate2
+# (tools/prepare_opusmt.py). Not needed to run the app afterwards.
+-r requirements.txt
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.6
+transformers>=4.45
+huggingface_hub>=0.24
+sacremoses>=0.1

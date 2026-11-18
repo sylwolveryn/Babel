@@ -1,0 +1,7 @@
+# Optional: everything tools/compare_translators.py can compare.
+-r requirements-opusmt-convert.txt
+
+argostranslate>=1.9
+# The MyMemory engine (--with-mymemory) calls its HTTP API directly.
+requests>=2.31.0
+psutil>=5.9
